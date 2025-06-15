@@ -6,6 +6,7 @@ using WebSocketSharp;
 using SimpleJSON;
 using System.Threading.Tasks;
 using Unity.VisualScripting.FullSerializer;
+using System;
 public class Receiver : MonoBehaviour
 {
     private WebSocket ws;
@@ -14,12 +15,26 @@ public class Receiver : MonoBehaviour
     private RTCPeerConnection pc;
     private RTCDataChannel dataChannel;
 
+    private DelegateOnIceConnectionChange pcOnIceConnectionChange;
+
+
+    private readonly Queue<System.Action> executeOnMainThread = new Queue<System.Action>();
+
+    private void Update()
+    {
+        lock (executeOnMainThread)
+        {
+            while (executeOnMainThread.Count > 0)
+            {
+                executeOnMainThread.Dequeue()?.Invoke();
+            }
+        }
+    }
 
     private void Start()
     {
-
-        InitWerbRTC();
         InitClient("185.123.68.55",8300);
+        StartCoroutine(InitWerbRTC());
     }
 
     private void OnDestroy()
@@ -42,9 +57,17 @@ public class Receiver : MonoBehaviour
         var offerOp = pc.CreateOffer();
         yield return offerOp;
         RTCSessionDescription offer = offerOp.Desc;
-        yield return pc.SetLocalDescription(ref offer);
+        
+        var setLocalDescriptionOp = pc.SetLocalDescription(ref offer);
+        yield return setLocalDescriptionOp;
+        if (setLocalDescriptionOp.IsError)
+        {
+            Debug.LogError("SetLocalDescription error: " + setLocalDescriptionOp.Error.message);
+            yield break;
+        }
         //Debug.Log(pc.PendingLocalDescription.sdp);
         Debug.Log(pc.LocalDescription.sdp);
+        Debug.Log(pc.SignalingState);
         var offerJson = new JSONObject();
         offerJson["type"] = "offer";
         offerJson["sdp"] = pc.LocalDescription.sdp;
@@ -58,13 +81,52 @@ public class Receiver : MonoBehaviour
             type = RTCSdpType.Answer,
             sdp = data["sdp"]
         };
-        Debug.Log(answer.ToString());
         var answerOP = pc.SetRemoteDescription(ref answer);
         yield return answerOP;
+        if (answerOP.IsError)
+        {
+            Debug.LogError("SetRemoteDescription error: " + answerOP.Error.message);
+            yield break;
+        }
         Debug.Log("Remote description set successfully.");
+        Debug.Log(pc.SignalingState);
+        // Wait one frame to ensure RemoteDescription is set
         Debug.Log("Remote SDP: " + pc.RemoteDescription.sdp);
     }
-    public void InitWerbRTC()
+    private void OnIceConnectionChange(RTCPeerConnection pc, RTCIceConnectionState state)
+    {
+        switch (state)
+        {
+            case RTCIceConnectionState.New:
+                Debug.Log($"{nameof(pc)} IceConnectionState: New");
+                break;
+            case RTCIceConnectionState.Checking:
+                Debug.Log($"{nameof(pc)} IceConnectionState: Checking");
+                break;
+            case RTCIceConnectionState.Closed:
+                Debug.Log($"{nameof(pc)} IceConnectionState: Closed");
+                break;
+            case RTCIceConnectionState.Completed:
+                Debug.Log($"{nameof(pc)} IceConnectionState: Completed");
+                break;
+            case RTCIceConnectionState.Connected:
+                Debug.Log($"{nameof(pc)} IceConnectionState: Connected");
+                break;
+            case RTCIceConnectionState.Disconnected:
+                Debug.Log($"{nameof(pc)} IceConnectionState: Disconnected");
+                break;
+            case RTCIceConnectionState.Failed:
+                Debug.Log($"{nameof(pc)} IceConnectionState: Failed");
+                break;
+            case RTCIceConnectionState.Max:
+                Debug.Log($"{nameof(pc)} IceConnectionState: Max");
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(state), state, null);
+        }
+    }
+
+    public IEnumerator InitWerbRTC()
     {
         var config = new RTCConfiguration
         {
@@ -84,6 +146,8 @@ public class Receiver : MonoBehaviour
         };
 
         pc = new RTCPeerConnection(ref config);
+        yield return pc;
+
 
         /*pc.OnIceCandidate = candidate =>
         {
@@ -95,7 +159,9 @@ public class Receiver : MonoBehaviour
             };
             ws.Send(candidateInit.ConvertToJson());
         };*/
-        pc.OnIceCandidate = candidate =>
+        pcOnIceConnectionChange = state => { OnIceConnectionChange(pc, state); };
+
+        /*pc.OnIceCandidate = candidate =>
         {
             if (candidate == null) return;
             var candidateJson = new JSONObject();
@@ -109,7 +175,7 @@ public class Receiver : MonoBehaviour
         pc.OnIceConnectionChange = state =>
         {
             Debug.Log($"ICE Connection State: {state}");
-        };
+        };*/
 
         pc.OnDataChannel = channel =>
         {
@@ -122,7 +188,8 @@ public class Receiver : MonoBehaviour
             };
         };
 
-        StartCoroutine(CreateOffer());
+        yield return StartCoroutine(CreateOffer());
+        Debug.Log(pc.LocalDescription.sdp);
     }
     public void InitClient(string serverIp, int serverPort = 8080)
     {
@@ -136,7 +203,7 @@ public class Receiver : MonoBehaviour
             ws = null;
         };
        
-        ws.OnMessage += async (sender, e) =>
+        ws.OnMessage += (sender, e) =>
         {
             var message = e.Data;
             Debug.Log($"Received message: {message}");
@@ -147,7 +214,13 @@ public class Receiver : MonoBehaviour
             switch (type)
             {
                 case "answer":
-                    StartCoroutine(CreateAnswer(data));
+                    lock (executeOnMainThread)
+                    {
+                        executeOnMainThread.Enqueue(() =>
+                        {
+                            StartCoroutine(CreateAnswer(data));
+                        });
+                    }
                     break;
 
                 case "candidate":
